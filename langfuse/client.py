@@ -2,7 +2,6 @@ import datetime as dt
 import logging
 import os
 import time
-import tracemalloc
 import typing
 import urllib.parse
 import uuid
@@ -1358,6 +1357,7 @@ class Langfuse(object):
             ):
                 return
 
+            import tracemalloc
             snapshot = tracemalloc.take_snapshot().statistics("lineno")
 
             total_memory_usage = sum([stat.size for stat in snapshot]) / 1024 / 1024
