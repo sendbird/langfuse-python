@@ -180,7 +180,7 @@ class LangfuseResourceManager:
                 environment=environment, release=release, sample_rate=sample_rate
             )
 
-            if os.environ.get("DISABLE_LANGFUSE_SPAN_PROCESSOR", "false").lower() == "true":
+            if os.environ.get("DISABLE_LANGFUSE_SPAN_PROCESSOR", "false").lower() != "true":
                 langfuse_logger.info("Configuration: Langfuse span processor is disabled. No spans will be exported to the Langfuse API unless you add span processors manually.")
                 langfuse_processor = LangfuseSpanProcessor(
                     public_key=self.public_key,
