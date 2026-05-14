@@ -134,6 +134,63 @@ def test_get_client_multiple_clients_preserve_different_settings():
     client_b.shutdown()
 
 
+def test_resource_manager_adds_langfuse_span_processor_by_default(monkeypatch):
+    with LangfuseResourceManager._lock:
+        LangfuseResourceManager._instances.clear()
+
+    monkeypatch.delenv("DISABLE_LANGFUSE_SPAN_PROCESSOR", raising=False)
+    monkeypatch.setenv("LANGFUSE_MEDIA_UPLOAD_ENABLED", "false")
+
+    processor = Mock(name="processor")
+    processor_class = Mock(return_value=processor)
+    monkeypatch.setattr(
+        "langfuse._client.resource_manager.LangfuseSpanProcessor",
+        processor_class,
+    )
+    tracer_provider = Mock()
+    tracer_provider.get_tracer.return_value = Mock()
+
+    resource_manager = LangfuseResourceManager(
+        public_key="pk-span-default",
+        secret_key="sk-span-default",
+        base_url="http://localhost:3000",
+        tracer_provider=tracer_provider,
+    )
+
+    processor_class.assert_called_once()
+    tracer_provider.add_span_processor.assert_called_once_with(processor)
+
+    resource_manager.shutdown()
+
+
+def test_resource_manager_can_disable_langfuse_span_processor(monkeypatch):
+    with LangfuseResourceManager._lock:
+        LangfuseResourceManager._instances.clear()
+
+    monkeypatch.setenv("DISABLE_LANGFUSE_SPAN_PROCESSOR", "true")
+    monkeypatch.setenv("LANGFUSE_MEDIA_UPLOAD_ENABLED", "false")
+
+    processor_class = Mock()
+    monkeypatch.setattr(
+        "langfuse._client.resource_manager.LangfuseSpanProcessor",
+        processor_class,
+    )
+    tracer_provider = Mock()
+    tracer_provider.get_tracer.return_value = Mock()
+
+    resource_manager = LangfuseResourceManager(
+        public_key="pk-span-disabled",
+        secret_key="sk-span-disabled",
+        base_url="http://localhost:3000",
+        tracer_provider=tracer_provider,
+    )
+
+    processor_class.assert_not_called()
+    tracer_provider.add_span_processor.assert_not_called()
+
+    resource_manager.shutdown()
+
+
 def test_score_ingestion_consumer_pause_wakes_blocked_thread():
     consumer = ScoreIngestionConsumer(
         ingestion_queue=Queue(),

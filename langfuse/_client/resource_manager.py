@@ -191,19 +191,29 @@ class LangfuseResourceManager:
             )
             self.tracer_provider = tracer_provider
 
-            langfuse_processor = LangfuseSpanProcessor(
-                public_key=self.public_key,
-                secret_key=secret_key,
-                base_url=base_url,
-                timeout=timeout,
-                flush_at=flush_at,
-                flush_interval=flush_interval,
-                blocked_instrumentation_scopes=blocked_instrumentation_scopes,
-                should_export_span=should_export_span,
-                additional_headers=additional_headers,
-                span_exporter=span_exporter,
-            )
-            tracer_provider.add_span_processor(langfuse_processor)
+            if (
+                os.environ.get("DISABLE_LANGFUSE_SPAN_PROCESSOR", "false").lower()
+                == "true"
+            ):
+                langfuse_logger.info(
+                    "Configuration: Langfuse span processor is disabled. No spans "
+                    "will be exported to the Langfuse API unless you add span "
+                    "processors manually."
+                )
+            else:
+                langfuse_processor = LangfuseSpanProcessor(
+                    public_key=self.public_key,
+                    secret_key=secret_key,
+                    base_url=base_url,
+                    timeout=timeout,
+                    flush_at=flush_at,
+                    flush_interval=flush_interval,
+                    blocked_instrumentation_scopes=blocked_instrumentation_scopes,
+                    should_export_span=should_export_span,
+                    additional_headers=additional_headers,
+                    span_exporter=span_exporter,
+                )
+                tracer_provider.add_span_processor(langfuse_processor)
 
             self._otel_tracer = tracer_provider.get_tracer(
                 LANGFUSE_TRACER_NAME,
