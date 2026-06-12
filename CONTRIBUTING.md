@@ -2,104 +2,141 @@
 
 ## Development
 
-### Add Poetry plugins
-
-```
-poetry self add poetry-dotenv-plugin
-poetry self add poetry-bumpversion
-```
-
 ### Install dependencies
 
-```
-poetry install --all-extras
+```bash
+uv sync --locked
 ```
 
-### Add Pre-commit
+### Add pre-commit
 
+```bash
+uv run pre-commit install
 ```
-poetry run pre-commit install
+
+### Quality checks
+
+```bash
+uv run --frozen ruff check .
+uv run --frozen ruff format .
+uv run --frozen mypy langfuse --no-error-summary
+```
+
+For a broad local confidence check, run:
+
+```bash
+bash scripts/codex/quick-check.sh
 ```
 
 ### Tests
 
-#### Setup
+Unit tests do not require a running Langfuse server:
 
-- Add .env based on .env.template
+```bash
+uv run --frozen pytest -n auto --dist worksteal tests/unit
+```
 
-#### Run
+E2E tests require a running Langfuse server and environment variables based on `.env.template`:
 
-- Run all
+```bash
+uv run --frozen pytest -n 4 --dist worksteal tests/e2e -m "not serial_e2e"
+uv run --frozen pytest tests/e2e -m "serial_e2e"
+```
 
-  ```
-  poetry run pytest -s -v --log-cli-level=INFO
-  ```
+Live-provider tests make real provider calls and require provider API keys:
 
-- Run a specific test
+```bash
+uv run --frozen pytest -n 4 --dist worksteal tests/live_provider -m "live_provider"
+```
 
-  ```
-  poetry run pytest -s -v --log-cli-level=INFO tests/test_core_sdk.py::test_flush
-  ```
+Run a specific test with:
 
-- E2E tests involving OpenAI and Serp API are usually skipped, remove skip decorators in [tests/test_langchain.py](tests/test_langchain.py) to run them.
+```bash
+uv run --frozen pytest tests/unit/test_resource_manager.py::test_pause_signals_score_consumer_shutdown
+```
 
-### Update openapi spec
+## Codex Cloud Setup
 
-1. Generate Fern Python SDK in [langfuse](https://github.com/langfuse/langfuse) and copy the files generated in `generated/python` into the `langfuse/api` folder in this repo.
-2. Execute the linter by running `poetry run ruff format .`
-3. Rebuild and deploy the package to PyPi.
+This repository includes repo-owned Codex setup so agents can start from a reproducible environment.
+
+Recommended Codex UI configuration:
+
+1. Create a Codex cloud environment for this repository.
+2. Set the setup script to:
+
+   ```bash
+   bash scripts/codex/setup.sh
+   ```
+
+3. Set the maintenance script to:
+
+   ```bash
+   bash scripts/codex/maintenance.sh
+   ```
+
+4. Keep agent internet access disabled by default, or allow only the domains required for the task.
+5. Add secrets and environment variables in the Codex UI instead of committing them.
+
+## Pull Requests
+
+PR titles and commit messages must follow Conventional Commits:
+
+```text
+type(scope): description
+type: description
+```
+
+Common types include `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`, and `security`.
+
+Before opening a PR:
+
+- Self-review the diff and use `code_review.md` for the repo-specific checklist.
+- Keep changes focused and avoid unrelated refactors.
+- Add or update tests for behavior changes.
+- List the verification commands you ran in the PR description.
+
+### Update OpenAPI spec
+
+The generated API client in `langfuse/api/` must not be hand-edited. Regenerate it from the upstream Fern/OpenAPI source.
 
 ### Publish release
 
-#### Release script
+Releases are automated via GitHub Actions using PyPI Trusted Publishing (OIDC).
 
-Make sure you have your PyPi API token setup in your poetry config. If not, you can set it up by running:
+To create a release:
 
-```sh
-poetry config pypi-token.pypi $your-api-token
-```
+1. Go to [Actions > Release Python SDK](https://github.com/langfuse/langfuse-python/actions/workflows/release.yml)
+2. Click "Run workflow"
+3. Select the version bump type:
+   - `patch` - Bug fixes (1.0.0 → 1.0.1)
+   - `minor` - New features (1.0.0 → 1.1.0)
+   - `major` - Breaking changes (1.0.0 → 2.0.0)
+   - `prepatch`, `preminor`, or `premajor` - Pre-release versions (for example 1.0.0 → 1.0.1a1)
+4. For pre-releases, select the type: `alpha`, `beta`, or `rc`
+5. Click "Run workflow"
 
-Run the release script:
-
-```sh
-poetry run release
-```
-
-#### Manual steps (for prepatch versions)
-
-1. `poetry version patch`
-   - `poetry version prepatch` for pre-release versions
-2. `poetry install`
-3. `poetry build`
-4. `git commit -am "chore: release v{version}"`
-5. `git push`
-6. `git tag v{version}`
-7. `git push --tags`
-8. `poetry publish`
-   - Create PyPi API token: <https://pypi.org/manage/account/token/>
-   - Setup: `poetry config pypi-token.pypi your-api-token`
-9. Create a release on GitHub with the changelog
+The workflow will automatically:
+- Bump the version in `pyproject.toml`
+- Build the package
+- Publish to PyPI
+- Create a git tag and GitHub release with auto-generated release notes
 
 ### SDK Reference
 
 Note: The generated SDK reference is currently work in progress.
 
-The SDK reference is generated via pdoc. You need to have all extra dependencies installed to generate the reference.
-
-```sh
-poetry install --all-extras
-```
+The SDK reference is generated via pdoc. The docs dependency group is installed on demand when you run the documentation commands.
 
 To update the reference, run the following command:
 
 ```sh
-poetry run pdoc -o docs/ --docformat google --logo "https://langfuse.com/langfuse_logo.svg" langfuse
+uv run --group docs pdoc -o docs/ --docformat google --logo "https://langfuse.com/langfuse_logo.svg" langfuse
 ```
 
 To run the reference locally, you can use the following command:
 
 ```sh
-poetry run pdoc --docformat google --logo "https://langfuse.com/langfuse_logo.svg" langfuse
+uv run --group docs pdoc --docformat google --logo "https://langfuse.com/langfuse_logo.svg" langfuse
 ```
 
 ## Credits

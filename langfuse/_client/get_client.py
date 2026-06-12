@@ -1,8 +1,62 @@
-from typing import Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator, Optional
 
 from langfuse._client.client import Langfuse
 from langfuse._client.resource_manager import LangfuseResourceManager
 from langfuse.logger import langfuse_logger
+
+# Context variable to track the current langfuse_public_key in execution context
+_current_public_key: ContextVar[Optional[str]] = ContextVar(
+    "langfuse_public_key", default=None
+)
+
+
+@contextmanager
+def _set_current_public_key(public_key: Optional[str]) -> Iterator[None]:
+    """Context manager to set and restore the current public key in execution context.
+
+    Args:
+        public_key: The public key to set in context. If None, context is not modified.
+
+    Yields:
+        None
+    """
+    if public_key is None:
+        yield  # Don't modify context if no key provided
+        return
+
+    token = _current_public_key.set(public_key)
+    try:
+        yield
+    finally:
+        _current_public_key.reset(token)
+
+
+def _create_client_from_instance(
+    instance: "LangfuseResourceManager", public_key: Optional[str] = None
+) -> Langfuse:
+    """Create a Langfuse client from a resource manager instance with all settings preserved."""
+    return Langfuse(
+        public_key=public_key or instance.public_key,
+        secret_key=instance.secret_key,
+        base_url=instance.base_url,
+        tracing_enabled=instance.tracing_enabled,
+        environment=instance.environment,
+        timeout=instance.timeout,
+        flush_at=instance.flush_at,
+        flush_interval=instance.flush_interval,
+        release=instance.release,
+        media_upload_thread_count=instance.media_upload_thread_count,
+        sample_rate=instance.sample_rate,
+        mask=instance.mask,
+        blocked_instrumentation_scopes=instance.blocked_instrumentation_scopes,
+        should_export_span=instance.should_export_span,
+        additional_headers=instance.additional_headers,
+        tracer_provider=instance.tracer_provider,
+        span_exporter=instance.span_exporter,
+        httpx_client=instance.httpx_client,
+    )
 
 
 def get_client(*, public_key: Optional[str] = None) -> Langfuse:
@@ -49,6 +103,10 @@ def get_client(*, public_key: Optional[str] = None) -> Langfuse:
     with LangfuseResourceManager._lock:
         active_instances = LangfuseResourceManager._instances
 
+        # If no explicit public_key provided, check execution context
+        if not public_key:
+            public_key = _current_public_key.get(None)
+
         if not public_key:
             if len(active_instances) == 0:
                 # No clients initialized yet, create default instance
@@ -61,12 +119,7 @@ def get_client(*, public_key: Optional[str] = None) -> Langfuse:
                 # Initialize with the credentials bound to the instance
                 # This is important if the original instance was instantiated
                 # via constructor arguments
-                return Langfuse(
-                    public_key=instance.public_key,
-                    secret_key=instance.secret_key,
-                    host=instance.host,
-                    tracing_enabled=instance.tracing_enabled,
-                )
+                return _create_client_from_instance(instance)
 
             else:
                 # Multiple clients exist but no key specified - disable tracing
@@ -94,9 +147,4 @@ def get_client(*, public_key: Optional[str] = None) -> Langfuse:
                 )
 
             # target_instance is guaranteed to be not None at this point
-            return Langfuse(
-                public_key=public_key,
-                secret_key=target_instance.secret_key,
-                host=target_instance.host,
-                tracing_enabled=target_instance.tracing_enabled,
-            )
+            return _create_client_from_instance(target_instance, public_key)

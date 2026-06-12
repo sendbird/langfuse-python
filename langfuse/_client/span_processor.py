@@ -13,20 +13,30 @@ Key features:
 
 import base64
 import os
-from typing import Dict, List, Optional
+import threading
+from typing import Callable, Dict, List, Optional, cast
 
+from opentelemetry import context as context_api
+from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace import ReadableSpan, Span
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
+from opentelemetry.trace import format_span_id, format_trace_id
 
-from langfuse._client.constants import LANGFUSE_TRACER_NAME
+from langfuse._client.attributes import LangfuseOtelSpanAttributes
 from langfuse._client.environment_variables import (
     LANGFUSE_FLUSH_AT,
     LANGFUSE_FLUSH_INTERVAL,
+    LANGFUSE_OTEL_TRACES_EXPORT_PATH,
 )
+from langfuse._client.propagation import (
+    _get_langfuse_trace_id_from_baggage,
+    _get_propagated_attributes_from_context,
+)
+from langfuse._client.span_filter import is_default_export_span, is_langfuse_span
 from langfuse._client.utils import span_formatter
+from langfuse._version import __version__ as langfuse_version
 from langfuse.logger import langfuse_logger
-from langfuse.version import __version__ as langfuse_version
 
 
 class LangfuseSpanProcessor(BatchSpanProcessor):
@@ -51,12 +61,14 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
         *,
         public_key: str,
         secret_key: str,
-        host: str,
+        base_url: str,
         timeout: Optional[int] = None,
         flush_at: Optional[int] = None,
         flush_interval: Optional[float] = None,
         blocked_instrumentation_scopes: Optional[List[str]] = None,
+        should_export_span: Optional[Callable[[ReadableSpan], bool]] = None,
         additional_headers: Optional[Dict[str, str]] = None,
+        span_exporter: Optional[SpanExporter] = None,
     ):
         self.public_key = public_key
         self.blocked_instrumentation_scopes = (
@@ -64,6 +76,10 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
             if blocked_instrumentation_scopes is not None
             else []
         )
+        self._should_export_span = should_export_span or is_default_export_span
+
+        self._app_root_lock = threading.Lock()
+        self._span_export_expectation_by_id: Dict[str, bool] = {}
 
         env_flush_at = os.environ.get(LANGFUSE_FLUSH_AT, None)
         flush_at = flush_at or int(env_flush_at) if env_flush_at is not None else None
@@ -75,29 +91,38 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
             else None
         )
 
-        basic_auth_header = "Basic " + base64.b64encode(
-            f"{public_key}:{secret_key}".encode("utf-8")
-        ).decode("ascii")
+        if span_exporter is None:
+            basic_auth_header = "Basic " + base64.b64encode(
+                f"{public_key}:{secret_key}".encode("utf-8")
+            ).decode("ascii")
 
-        # Prepare default headers
-        default_headers = {
-            "Authorization": basic_auth_header,
-            "x_langfuse_sdk_name": "python",
-            "x_langfuse_sdk_version": langfuse_version,
-            "x_langfuse_public_key": public_key,
-        }
+            # Prepare default headers
+            default_headers = {
+                "Authorization": basic_auth_header,
+                "x-langfuse-sdk-name": "python",
+                "x-langfuse-sdk-version": langfuse_version,
+                "x-langfuse-public-key": public_key,
+            }
 
-        # Merge additional headers if provided
-        headers = {**default_headers, **(additional_headers or {})}
+            # Merge additional headers if provided
+            headers = {**default_headers, **(additional_headers or {})}
 
-        langfuse_span_exporter = OTLPSpanExporter(
-            endpoint=f"{host}/api/public/otel/v1/traces",
-            headers=headers,
-            timeout=timeout,
-        )
+            traces_export_path = os.environ.get(LANGFUSE_OTEL_TRACES_EXPORT_PATH, None)
+
+            endpoint = (
+                f"{base_url}/{traces_export_path}"
+                if traces_export_path
+                else f"{base_url}/api/public/otel/v1/traces"
+            )
+
+            span_exporter = OTLPSpanExporter(
+                endpoint=endpoint,
+                headers=headers,
+                timeout=timeout,
+            )
 
         super().__init__(
-            span_exporter=langfuse_span_exporter,
+            span_exporter=span_exporter,
             export_timeout_millis=timeout * 1_000 if timeout else None,
             max_export_batch_size=flush_at,
             schedule_delay_millis=flush_interval * 1_000
@@ -105,32 +130,129 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
             else None,
         )
 
-    def on_end(self, span: ReadableSpan) -> None:
-        # Only export spans that belong to the scoped project
-        # This is important to not send spans to wrong project in multi-project setups
-        if self._is_langfuse_span(span) and not self._is_langfuse_project_span(span):
+    def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
+        context = parent_context or context_api.get_current()
+        propagated_attributes = _get_propagated_attributes_from_context(context)
+
+        if propagated_attributes:
+            span.set_attributes(propagated_attributes)
+
             langfuse_logger.debug(
-                f"Security: Span rejected - belongs to project '{span.instrumentation_scope.attributes.get('public_key') if span.instrumentation_scope and span.instrumentation_scope.attributes else None}' but processor is for '{self.public_key}'. "
-                f"This prevents cross-project data leakage in multi-project environments."
+                f"Propagated {len(propagated_attributes)} attributes to span '{format_span_id(span.context.span_id)}': {propagated_attributes}"
             )
-            return
 
-        # Do not export spans from blocked instrumentation scopes
-        if self._is_blocked_instrumentation_scope(span):
-            return
+        try:
+            self._mark_app_root_candidate(span=span, parent_context=context)
+        except Exception as error:
+            langfuse_logger.debug(
+                "Trace: app-root start-time check failed. Span will not be marked as app root | "
+                f"span_name='{getattr(span, 'name', '<unknown>')}' | "
+                f"Error: {error}"
+            )
 
-        langfuse_logger.debug(
-            f"Trace: Processing span name='{span._name}' | Full details:\n{span_formatter(span)}"
-        )
+        return super().on_start(span, parent_context)
 
-        super().on_end(span)
+    def on_end(self, span: ReadableSpan) -> None:
+        try:
+            # Only export spans that belong to the scoped project
+            # This is important to not send spans to wrong project in multi-project setups
+            if is_langfuse_span(span) and not self._is_langfuse_project_span(span):
+                langfuse_logger.debug(
+                    f"Security: Span rejected - belongs to project '{span.instrumentation_scope.attributes.get('public_key') if span.instrumentation_scope and span.instrumentation_scope.attributes else None}' but processor is for '{self.public_key}'. "
+                    f"This prevents cross-project data leakage in multi-project environments."
+                )
+                return
 
-    @staticmethod
-    def _is_langfuse_span(span: ReadableSpan) -> bool:
-        return (
-            span.instrumentation_scope is not None
-            and span.instrumentation_scope.name == LANGFUSE_TRACER_NAME
-        )
+            # Do not export spans from blocked instrumentation scopes
+            if self._is_blocked_instrumentation_scope(span):
+                langfuse_logger.debug(
+                    "Trace: Dropping span due to blocked instrumentation scope | "
+                    f"span_name='{span.name}' | "
+                    f"instrumentation_scope='{self._get_scope_name(span)}'"
+                )
+                return
+
+            # Apply custom or default span filter
+            try:
+                should_export = self._should_export_span(span)
+            except Exception as error:
+                langfuse_logger.error(
+                    "Trace: should_export_span callback raised an error. "
+                    f"Dropping span name='{span.name}' scope='{self._get_scope_name(span)}'. "
+                    f"Error: {error}"
+                )
+                return
+
+            if not should_export:
+                langfuse_logger.debug(
+                    "Trace: Dropping span due to should_export_span filter | "
+                    f"span_name='{span.name}' | "
+                    f"instrumentation_scope='{self._get_scope_name(span)}'"
+                )
+                return
+
+            langfuse_logger.debug(
+                f"Trace: Processing span name='{span._name}' | Full details:\n{span_formatter(span)}"
+            )
+
+            super().on_end(span)
+        finally:
+            self._cleanup_app_root_state(span)
+
+    def _mark_app_root_candidate(self, *, span: Span, parent_context: Context) -> None:
+        trace_id = format_trace_id(span.context.trace_id)
+        span_id = format_span_id(span.context.span_id)
+        parent_span_id = format_span_id(span.parent.span_id) if span.parent else None
+        expected_exported = self._is_expected_exported_at_start(span)
+        propagated_trace_id = _get_langfuse_trace_id_from_baggage(parent_context)
+
+        with self._app_root_lock:
+            parent_expected_exported = (
+                parent_span_id is not None
+                and self._span_export_expectation_by_id.get(parent_span_id) is True
+            )
+            suppressed_by_parent_claim = propagated_trace_id == trace_id
+
+            self._span_export_expectation_by_id[span_id] = expected_exported
+
+            mark_app_root = (
+                expected_exported
+                and not parent_expected_exported
+                and not suppressed_by_parent_claim
+            )
+
+        if mark_app_root:
+            span.set_attribute(LangfuseOtelSpanAttributes.IS_APP_ROOT, True)
+
+    def _cleanup_app_root_state(self, span: ReadableSpan) -> None:
+        span_id = format_span_id(span.context.span_id)
+
+        with self._app_root_lock:
+            self._span_export_expectation_by_id.pop(span_id, None)
+
+    def _is_expected_exported_at_start(self, span: Span) -> bool:
+        readable_span = cast(ReadableSpan, span)
+
+        if is_langfuse_span(readable_span) and not self._is_langfuse_project_span(
+            readable_span
+        ):
+            return False
+
+        if self._is_blocked_instrumentation_scope(readable_span):
+            return False
+
+        try:
+            return bool(self._should_export_span(readable_span))
+        except Exception as error:
+            langfuse_logger.debug(
+                "Trace: should_export_span callback raised during app-root "
+                f"start-time check. Span will not be marked as app root | "
+                f"span_name='{readable_span.name}' | "
+                f"instrumentation_scope='{self._get_scope_name(readable_span)}' | "
+                f"Error: {error}"
+            )
+
+            return False
 
     def _is_blocked_instrumentation_scope(self, span: ReadableSpan) -> bool:
         return (
@@ -139,7 +261,7 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
         )
 
     def _is_langfuse_project_span(self, span: ReadableSpan) -> bool:
-        if not LangfuseSpanProcessor._is_langfuse_span(span):
+        if not is_langfuse_span(span):
             return False
 
         if span.instrumentation_scope is not None:
@@ -152,3 +274,10 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
             return public_key_on_span == self.public_key
 
         return False
+
+    @staticmethod
+    def _get_scope_name(span: ReadableSpan) -> Optional[str]:
+        if span.instrumentation_scope is None:
+            return None
+
+        return span.instrumentation_scope.name

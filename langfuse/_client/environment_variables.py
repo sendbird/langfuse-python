@@ -35,13 +35,31 @@ LANGFUSE_SECRET_KEY = "LANGFUSE_SECRET_KEY"
 Secret API key of Langfuse project
 """
 
+LANGFUSE_BASE_URL = "LANGFUSE_BASE_URL"
+"""
+.. envvar:: LANGFUSE_BASE_URL
+
+Base URL of Langfuse API. Can be set via `LANGFUSE_BASE_URL` environment variable.
+
+**Default value:** ``"https://cloud.langfuse.com"``
+"""
+
 LANGFUSE_HOST = "LANGFUSE_HOST"
 """
 .. envvar:: LANGFUSE_HOST
 
-Host of Langfuse API. Can be set via `LANGFUSE_HOST` environment variable.
+Deprecated. Use LANGFUSE_BASE_URL instead. Host of Langfuse API. Can be set via `LANGFUSE_HOST` environment variable.
 
 **Default value:** ``"https://cloud.langfuse.com"``
+"""
+
+LANGFUSE_OTEL_TRACES_EXPORT_PATH = "LANGFUSE_OTEL_TRACES_EXPORT_PATH"
+"""
+.. envvar:: LANGFUSE_OTEL_TRACES_EXPORT_PATH
+
+URL path on the configured host to export traces to.
+
+**Default value:** ``/api/public/otel/v1/traces``
 """
 
 LANGFUSE_DEBUG = "LANGFUSE_DEBUG"
@@ -76,7 +94,7 @@ LANGFUSE_FLUSH_AT = "LANGFUSE_FLUSH_AT"
 .. envvar:: LANGFUSE_FLUSH_AT
 
 Max batch size until a new ingestion batch is sent to the API.
-**Default value:** ``15``
+**Default value:** same as OTEL ``OTEL_BSP_MAX_EXPORT_BATCH_SIZE``
 """
 
 LANGFUSE_FLUSH_INTERVAL = "LANGFUSE_FLUSH_INTERVAL"
@@ -84,7 +102,7 @@ LANGFUSE_FLUSH_INTERVAL = "LANGFUSE_FLUSH_INTERVAL"
 .. envvar:: LANGFUSE_FLUSH_INTERVAL
 
 Max delay in seconds until a new ingestion batch is sent to the API.
-**Default value:** ``1``
+**Default value:** same as OTEL ``OTEL_BSP_SCHEDULE_DELAY``
 """
 
 LANGFUSE_SAMPLE_RATE = "LANGFUSE_SAMPLE_RATE"
@@ -127,4 +145,14 @@ LANGFUSE_TIMEOUT = "LANGFUSE_TIMEOUT"
 Controls the timeout for all API requests in seconds
 
 **Default value**: ``5``
+"""
+
+LANGFUSE_PROMPT_CACHE_DEFAULT_TTL_SECONDS = "LANGFUSE_PROMPT_CACHE_DEFAULT_TTL_SECONDS"
+"""
+.. envvar: LANGFUSE_PROMPT_CACHE_DEFAULT_TTL_SECONDS
+
+Controls the default time-to-live (TTL) in seconds for cached prompts.
+This setting determines how long prompt responses are cached before they expire.
+
+**Default value**: ``60``
 """

@@ -12,11 +12,16 @@ The module includes:
 
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
+from langfuse._client.constants import (
+    ObservationTypeGenerationLike,
+    ObservationTypeSpanLike,
+)
 from langfuse._utils.serializer import EventSerializer
+from langfuse.api import MapValue
 from langfuse.model import PromptClient
-from langfuse.types import MapValue, SpanLevel
+from langfuse.types import SpanLevel
 
 
 class LangfuseOtelSpanAttributes:
@@ -54,32 +59,30 @@ class LangfuseOtelSpanAttributes:
 
     # Internal
     AS_ROOT = "langfuse.internal.as_root"
+    IS_APP_ROOT = "langfuse.internal.is_app_root"
+
+    # Experiments
+    EXPERIMENT_ID = "langfuse.experiment.id"
+    EXPERIMENT_NAME = "langfuse.experiment.name"
+    EXPERIMENT_DESCRIPTION = "langfuse.experiment.description"
+    EXPERIMENT_METADATA = "langfuse.experiment.metadata"
+    EXPERIMENT_DATASET_ID = "langfuse.experiment.dataset.id"
+    EXPERIMENT_ITEM_ID = "langfuse.experiment.item.id"
+    EXPERIMENT_ITEM_EXPECTED_OUTPUT = "langfuse.experiment.item.expected_output"
+    EXPERIMENT_ITEM_METADATA = "langfuse.experiment.item.metadata"
+    EXPERIMENT_ITEM_ROOT_OBSERVATION_ID = "langfuse.experiment.item.root_observation_id"
 
 
 def create_trace_attributes(
     *,
-    name: Optional[str] = None,
-    user_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    version: Optional[str] = None,
-    release: Optional[str] = None,
     input: Optional[Any] = None,
     output: Optional[Any] = None,
-    metadata: Optional[Any] = None,
-    tags: Optional[List[str]] = None,
     public: Optional[bool] = None,
 ) -> dict:
     attributes = {
-        LangfuseOtelSpanAttributes.TRACE_NAME: name,
-        LangfuseOtelSpanAttributes.TRACE_USER_ID: user_id,
-        LangfuseOtelSpanAttributes.TRACE_SESSION_ID: session_id,
-        LangfuseOtelSpanAttributes.VERSION: version,
-        LangfuseOtelSpanAttributes.RELEASE: release,
         LangfuseOtelSpanAttributes.TRACE_INPUT: _serialize(input),
         LangfuseOtelSpanAttributes.TRACE_OUTPUT: _serialize(output),
-        LangfuseOtelSpanAttributes.TRACE_TAGS: tags,
         LangfuseOtelSpanAttributes.TRACE_PUBLIC: public,
-        **_flatten_and_serialize_metadata(metadata, "trace"),
     }
 
     return {k: v for k, v in attributes.items() if v is not None}
@@ -93,9 +96,12 @@ def create_span_attributes(
     level: Optional[SpanLevel] = None,
     status_message: Optional[str] = None,
     version: Optional[str] = None,
+    observation_type: Optional[
+        Union[ObservationTypeSpanLike, Literal["event"]]
+    ] = "span",
 ) -> dict:
     attributes = {
-        LangfuseOtelSpanAttributes.OBSERVATION_TYPE: "span",
+        LangfuseOtelSpanAttributes.OBSERVATION_TYPE: observation_type,
         LangfuseOtelSpanAttributes.OBSERVATION_LEVEL: level,
         LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE: status_message,
         LangfuseOtelSpanAttributes.VERSION: version,
@@ -122,9 +128,10 @@ def create_generation_attributes(
     usage_details: Optional[Dict[str, int]] = None,
     cost_details: Optional[Dict[str, float]] = None,
     prompt: Optional[PromptClient] = None,
+    observation_type: Optional[ObservationTypeGenerationLike] = "generation",
 ) -> dict:
     attributes = {
-        LangfuseOtelSpanAttributes.OBSERVATION_TYPE: "generation",
+        LangfuseOtelSpanAttributes.OBSERVATION_TYPE: observation_type,
         LangfuseOtelSpanAttributes.OBSERVATION_LEVEL: level,
         LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE: status_message,
         LangfuseOtelSpanAttributes.VERSION: version,
@@ -152,7 +159,36 @@ def create_generation_attributes(
 
 
 def _serialize(obj: Any) -> Optional[str]:
-    return json.dumps(obj, cls=EventSerializer) if obj is not None else None
+    if obj is None or isinstance(obj, str):
+        return obj
+
+    return json.dumps(obj, cls=EventSerializer)
+
+
+def _flatten_and_serialize_metadata_values(
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    if metadata is None:
+        return None
+
+    flattened_metadata: Dict[str, str] = {}
+
+    def flatten_value(path: str, value: Any) -> None:
+        if isinstance(value, dict):
+            for nested_key, nested_value in value.items():
+                flatten_value(f"{path}.{nested_key}", nested_value)
+
+            return
+
+        serialized_value = _serialize(value)
+
+        if serialized_value is not None:
+            flattened_metadata[path] = serialized_value
+
+    for key, value in metadata.items():
+        flatten_value(str(key), value)
+
+    return flattened_metadata
 
 
 def _flatten_and_serialize_metadata(

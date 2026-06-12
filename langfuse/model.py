@@ -4,50 +4,21 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict, Union
 
-from langfuse.api.resources.commons.types.dataset import (
-    Dataset,  # noqa: F401
+from langfuse.api import (
+    CreateDatasetItemRequest,  # noqa
+    CreateDatasetRequest,  # noqa
+    Dataset,  # noqa
+    DatasetItem,  # noqa
+    DatasetRun,  # noqa
+    DatasetStatus,  # noqa
+    MapValue,  # noqa
+    Observation,  # noqa
+    Prompt,
+    Prompt_Chat,
+    Prompt_Text,
+    TraceWithFullDetails,  # noqa
 )
-
-# these imports need to stay here, otherwise imports from our clients wont work
-from langfuse.api.resources.commons.types.dataset_item import DatasetItem  # noqa: F401
-
-# noqa: F401
-from langfuse.api.resources.commons.types.dataset_run import DatasetRun  # noqa: F401
-
-# noqa: F401
-from langfuse.api.resources.commons.types.dataset_status import (  # noqa: F401
-    DatasetStatus,
-)
-from langfuse.api.resources.commons.types.map_value import MapValue  # noqa: F401
-from langfuse.api.resources.commons.types.observation import Observation  # noqa: F401
-from langfuse.api.resources.commons.types.trace_with_full_details import (  # noqa: F401
-    TraceWithFullDetails,
-)
-
-# noqa: F401
-from langfuse.api.resources.dataset_items.types.create_dataset_item_request import (  # noqa: F401
-    CreateDatasetItemRequest,
-)
-from langfuse.api.resources.dataset_run_items.types.create_dataset_run_item_request import (  # noqa: F401
-    CreateDatasetRunItemRequest,
-)
-
-# noqa: F401
-from langfuse.api.resources.datasets.types.create_dataset_request import (  # noqa: F401
-    CreateDatasetRequest,
-)
-from langfuse.api.resources.prompts import Prompt, Prompt_Chat, Prompt_Text
 from langfuse.logger import langfuse_logger
-
-
-class ModelUsage(TypedDict):
-    unit: Optional[str]
-    input: Optional[int]
-    output: Optional[int]
-    total: Optional[int]
-    input_cost: Optional[float]
-    output_cost: Optional[float]
-    total_cost: Optional[float]
 
 
 class ChatMessageDict(TypedDict):
@@ -165,7 +136,13 @@ class BasePromptClient(ABC):
         self, **kwargs: Union[str, Any]
     ) -> Union[
         str,
-        Sequence[Union[ChatMessageDict, ChatMessageWithPlaceholdersDict_Placeholder]],
+        Sequence[
+            Union[
+                Dict[str, Any],
+                ChatMessageDict,
+                ChatMessageWithPlaceholdersDict_Placeholder,
+            ]
+        ],
     ]:
         pass
 
@@ -327,7 +304,11 @@ class ChatPromptClient(BasePromptClient):
     def compile(
         self,
         **kwargs: Union[str, Any],
-    ) -> Sequence[Union[ChatMessageDict, ChatMessageWithPlaceholdersDict_Placeholder]]:
+    ) -> Sequence[
+        Union[
+            Dict[str, Any], ChatMessageDict, ChatMessageWithPlaceholdersDict_Placeholder
+        ]
+    ]:
         """Compile the prompt with placeholders and variables.
 
         Args:
@@ -338,7 +319,11 @@ class ChatPromptClient(BasePromptClient):
             List of compiled chat messages as plain dictionaries, with unresolved placeholders kept as-is.
         """
         compiled_messages: List[
-            Union[ChatMessageDict, ChatMessageWithPlaceholdersDict_Placeholder]
+            Union[
+                Dict[str, Any],
+                ChatMessageDict,
+                ChatMessageWithPlaceholdersDict_Placeholder,
+            ]
         ] = []
         unresolved_placeholders: List[ChatMessageWithPlaceholdersDict_Placeholder] = []
 
@@ -361,20 +346,18 @@ class ChatPromptClient(BasePromptClient):
                     placeholder_value = kwargs[placeholder_name]
                     if isinstance(placeholder_value, list):
                         for msg in placeholder_value:
-                            if (
-                                isinstance(msg, dict)
-                                and "role" in msg
-                                and "content" in msg
-                            ):
-                                compiled_messages.append(
-                                    ChatMessageDict(
-                                        role=msg["role"],  # type: ignore
-                                        content=TemplateParser.compile_template(
-                                            msg["content"],  # type: ignore
-                                            kwargs,
-                                        ),
-                                    ),
+                            if isinstance(msg, dict):
+                                # Preserve all fields from the original message, such as tool calls
+                                compiled_msg = dict(msg)  # type: ignore
+                                # Ensure role and content are always present
+                                compiled_msg["role"] = msg.get("role", "NOT_GIVEN")
+                                compiled_msg["content"] = (
+                                    TemplateParser.compile_template(
+                                        msg.get("content", ""),  # type: ignore
+                                        kwargs,
+                                    )
                                 )
+                                compiled_messages.append(compiled_msg)
                             else:
                                 compiled_messages.append(
                                     ChatMessageDict(

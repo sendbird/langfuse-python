@@ -17,13 +17,12 @@ The integration is fully interoperable with the `observe()` decorator and the lo
 See docs for more details: https://langfuse.com/docs/integrations/openai
 """
 
-import logging
 import types
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from inspect import isclass
-from typing import Optional, cast, Any
+from inspect import isawaitable, isclass
+from typing import Any, Optional, cast
 
 from openai._types import NotGiven
 from packaging.version import Version
@@ -33,24 +32,16 @@ from wrapt import wrap_function_wrapper
 from langfuse._client.get_client import get_client
 from langfuse._client.span import LangfuseGeneration
 from langfuse._utils import _get_timestamp
+from langfuse.logger import langfuse_logger as logger
 from langfuse.media import LangfuseMedia
 
 try:
     import openai
+    from openai import AsyncAzureOpenAI, AsyncOpenAI, AzureOpenAI, OpenAI  # noqa: F401
 except ImportError:
     raise ModuleNotFoundError(
         "Please install OpenAI to use this feature: 'pip install openai'"
     )
-
-try:
-    from openai import AsyncAzureOpenAI, AsyncOpenAI, AzureOpenAI, OpenAI  # noqa: F401
-except ImportError:
-    AsyncAzureOpenAI = None  # type: ignore
-    AsyncOpenAI = None  # type: ignore
-    AzureOpenAI = None  # type: ignore
-    OpenAI = None  # type: ignore
-
-log = logging.getLogger("langfuse")
 
 
 @dataclass
@@ -161,6 +152,36 @@ OPENAI_METHODS_V1 = [
         sync=False,
         min_version="1.66.0",
     ),
+    OpenAiDefinition(
+        module="openai.resources.responses",
+        object="Responses",
+        method="parse",
+        type="chat",
+        sync=True,
+        min_version="1.66.0",
+    ),
+    OpenAiDefinition(
+        module="openai.resources.responses",
+        object="AsyncResponses",
+        method="parse",
+        type="chat",
+        sync=False,
+        min_version="1.66.0",
+    ),
+    OpenAiDefinition(
+        module="openai.resources.embeddings",
+        object="Embeddings",
+        method="create",
+        type="embedding",
+        sync=True,
+    ),
+    OpenAiDefinition(
+        module="openai.resources.embeddings",
+        object="AsyncEmbeddings",
+        method="create",
+        type="embedding",
+        sync=False,
+    ),
 ]
 
 
@@ -223,6 +244,34 @@ def _langfuse_wrapper(func: Any) -> Any:
         return wrapper
 
     return _with_langfuse
+
+
+def _extract_responses_prompt(kwargs: Any) -> Any:
+    input_value = kwargs.get("input", None)
+    instructions = kwargs.get("instructions", None)
+
+    if isinstance(input_value, NotGiven):
+        input_value = None
+
+    if isinstance(instructions, NotGiven):
+        instructions = None
+
+    if instructions is None:
+        return input_value
+
+    if input_value is None:
+        return {"instructions": instructions}
+
+    if isinstance(input_value, str):
+        return [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": input_value},
+        ]
+
+    if isinstance(input_value, list):
+        return [{"role": "system", "content": instructions}, *input_value]
+
+    return {"instructions": instructions, "input": input_value}
 
 
 def _extract_chat_prompt(kwargs: Any) -> Any:
@@ -324,10 +373,13 @@ def _extract_chat_response(kwargs: Any) -> Any:
 
 
 def _get_langfuse_data_from_kwargs(resource: OpenAiDefinition, kwargs: Any) -> Any:
-    name = kwargs.get("name", "OpenAI-generation")
+    default_name = (
+        "OpenAI-embedding" if resource.type == "embedding" else "OpenAI-generation"
+    )
+    name = kwargs.get("name", default_name)
 
     if name is None:
-        name = "OpenAI-generation"
+        name = default_name
 
     if name is not None and not isinstance(name, str):
         raise TypeError("name must be a string")
@@ -367,7 +419,10 @@ def _get_langfuse_data_from_kwargs(resource: OpenAiDefinition, kwargs: Any) -> A
         and not isinstance(metadata, NotGiven)
         and not isinstance(metadata, dict)
     ):
-        raise TypeError("metadata must be a dictionary")
+        if isinstance(metadata, BaseModel):
+            metadata = metadata.model_dump()
+        else:
+            metadata = {}
 
     model = kwargs.get("model", None) or None
 
@@ -375,10 +430,12 @@ def _get_langfuse_data_from_kwargs(resource: OpenAiDefinition, kwargs: Any) -> A
 
     if resource.type == "completion":
         prompt = kwargs.get("prompt", None)
-    elif resource.object == "Responses":
-        prompt = kwargs.get("input", None)
+    elif resource.object == "Responses" or resource.object == "AsyncResponses":
+        prompt = _extract_responses_prompt(kwargs)
     elif resource.type == "chat":
         prompt = _extract_chat_prompt(kwargs)
+    elif resource.type == "embedding":
+        prompt = kwargs.get("input", None)
 
     parsed_temperature = (
         kwargs.get("temperature", 1)
@@ -390,6 +447,12 @@ def _get_langfuse_data_from_kwargs(resource: OpenAiDefinition, kwargs: Any) -> A
         kwargs.get("max_tokens", float("inf"))
         if not isinstance(kwargs.get("max_tokens", float("inf")), NotGiven)
         else float("inf")
+    )
+
+    parsed_max_completion_tokens = (
+        kwargs.get("max_completion_tokens", None)
+        if not isinstance(kwargs.get("max_completion_tokens", float("inf")), NotGiven)
+        else None
     )
 
     parsed_top_p = (
@@ -418,18 +481,41 @@ def _get_langfuse_data_from_kwargs(resource: OpenAiDefinition, kwargs: Any) -> A
 
     parsed_n = kwargs.get("n", 1) if not isinstance(kwargs.get("n", 1), NotGiven) else 1
 
-    modelParameters = {
-        "temperature": parsed_temperature,
-        "max_tokens": parsed_max_tokens,  # casing?
-        "top_p": parsed_top_p,
-        "frequency_penalty": parsed_frequency_penalty,
-        "presence_penalty": parsed_presence_penalty,
-    }
-    if parsed_n is not None and parsed_n > 1:
-        modelParameters["n"] = parsed_n
+    if resource.type == "embedding":
+        parsed_dimensions = (
+            kwargs.get("dimensions", None)
+            if not isinstance(kwargs.get("dimensions", None), NotGiven)
+            else None
+        )
+        parsed_encoding_format = (
+            kwargs.get("encoding_format", "float")
+            if not isinstance(kwargs.get("encoding_format", "float"), NotGiven)
+            else "float"
+        )
 
-    if parsed_seed is not None:
-        modelParameters["seed"] = parsed_seed
+        modelParameters = {}
+        if parsed_dimensions is not None:
+            modelParameters["dimensions"] = parsed_dimensions
+        if parsed_encoding_format != "float":
+            modelParameters["encoding_format"] = parsed_encoding_format
+    else:
+        modelParameters = {
+            "temperature": parsed_temperature,
+            "max_tokens": parsed_max_tokens,
+            "top_p": parsed_top_p,
+            "frequency_penalty": parsed_frequency_penalty,
+            "presence_penalty": parsed_presence_penalty,
+        }
+
+        if parsed_max_completion_tokens is not None:
+            modelParameters.pop("max_tokens", None)
+            modelParameters["max_completion_tokens"] = parsed_max_completion_tokens
+
+        if parsed_n is not None and isinstance(parsed_n, int) and parsed_n > 1:
+            modelParameters["n"] = parsed_n
+
+        if parsed_seed is not None:
+            modelParameters["seed"] = parsed_seed
 
     langfuse_prompt = kwargs.get("langfuse_prompt", None)
 
@@ -467,6 +553,7 @@ def _create_langfuse_update(
 
     if usage is not None:
         update["usage_details"] = _parse_usage(usage)
+        update["cost_details"] = _parse_cost(usage)
 
     generation.update(**update)
 
@@ -480,8 +567,8 @@ def _parse_usage(usage: Optional[Any] = None) -> Any:
     for tokens_details in [
         "prompt_tokens_details",
         "completion_tokens_details",
-        "input_token_details",
-        "output_token_details",
+        "input_tokens_details",
+        "output_tokens_details",
     ]:
         if tokens_details in usage_dict and usage_dict[tokens_details] is not None:
             tokens_details_dict = (
@@ -493,7 +580,27 @@ def _parse_usage(usage: Optional[Any] = None) -> Any:
                 k: v for k, v in tokens_details_dict.items() if v is not None
             }
 
+    if (
+        len(usage_dict) == 2
+        and "prompt_tokens" in usage_dict
+        and "total_tokens" in usage_dict
+    ):
+        # handle embedding usage
+        return {"input": usage_dict["prompt_tokens"]}
+
     return usage_dict
+
+
+def _parse_cost(usage: Optional[Any] = None) -> Any:
+    if usage is None:
+        return
+
+    # OpenRouter is returning total cost of the invocation
+    # https://openrouter.ai/docs/use-cases/usage-accounting#cost-breakdown
+    if hasattr(usage, "cost") and isinstance(getattr(usage, "cost"), float):
+        return {"total": getattr(usage, "cost")}
+
+    return None
 
 
 def _extract_streamed_response_api_response(chunks: Any) -> Any:
@@ -503,7 +610,8 @@ def _extract_streamed_response_api_response(chunks: Any) -> Any:
     for raw_chunk in chunks:
         chunk = raw_chunk.__dict__
         if raw_response := chunk.get("response", None):
-            usage = chunk.get("usage", None)
+            usage = chunk.get("usage", None) or getattr(raw_response, "usage", None)
+
             response = raw_response.__dict__
             model = response.get("model")
 
@@ -525,14 +633,16 @@ def _extract_streamed_response_api_response(chunks: Any) -> Any:
 
 def _extract_streamed_openai_response(resource: Any, chunks: Any) -> Any:
     completion: Any = defaultdict(lambda: None) if resource.type == "chat" else ""
-    model, usage = None, None
+    model, usage, finish_reason = None, None, None
 
     for chunk in chunks:
         if _is_openai_v1():
             chunk = chunk.__dict__
 
         model = model or chunk.get("model", None) or None
-        usage = chunk.get("usage", None)
+        chunk_usage = chunk.get("usage", None)
+        if chunk_usage is not None:
+            usage = chunk_usage
 
         choices = chunk.get("choices", [])
 
@@ -541,9 +651,15 @@ def _extract_streamed_openai_response(resource: Any, chunks: Any) -> Any:
                 choice = choice.__dict__
             if resource.type == "chat":
                 delta = choice.get("delta", None)
+                choice_finish_reason = choice.get("finish_reason", None)
+                if choice_finish_reason is not None:
+                    finish_reason = choice_finish_reason
 
-                if _is_openai_v1():
+                if _is_openai_v1() and delta is not None:
                     delta = delta.__dict__
+
+                if delta is None:
+                    delta = {}
 
                 if delta.get("role", None) is not None:
                     completion["role"] = delta["role"]
@@ -570,7 +686,10 @@ def _extract_streamed_openai_response(resource: Any, chunks: Any) -> Any:
                         )
                         curr["arguments"] += getattr(tool_call_chunk, "arguments", "")
 
-                elif delta.get("tool_calls", None) is not None and len(delta.get("tool_calls")) > 0:
+                elif (
+                    delta.get("tool_calls", None) is not None
+                    and len(delta.get("tool_calls")) > 0
+                ):
                     curr = completion["tool_calls"]
                     tool_call_chunk = getattr(
                         delta.get("tool_calls", None)[0], "function", None
@@ -598,8 +717,12 @@ def _extract_streamed_openai_response(resource: Any, chunks: Any) -> Any:
                         curr[-1]["name"] = curr[-1]["name"] or getattr(
                             tool_call_chunk, "name", None
                         )
+
+                        if curr[-1]["arguments"] is None:
+                            curr[-1]["arguments"] = ""
+
                         curr[-1]["arguments"] += getattr(
-                            tool_call_chunk, "arguments", None
+                            tool_call_chunk, "arguments", ""
                         )
 
             if resource.type == "completion":
@@ -632,7 +755,7 @@ def _extract_streamed_openai_response(resource: Any, chunks: Any) -> Any:
         model,
         get_response_for_chat() if resource.type == "chat" else completion,
         usage,
-        None,
+        {"finish_reason": finish_reason} if finish_reason is not None else None,
     )
 
 
@@ -653,7 +776,7 @@ def _get_langfuse_data_from_default_response(
 
             completion = choice.text if _is_openai_v1() else choice.get("text", None)
 
-    elif resource.object == "Responses":
+    elif resource.object == "Responses" or resource.object == "AsyncResponses":
         output = response.get("output", {})
 
         if not isinstance(output, list):
@@ -682,6 +805,20 @@ def _get_langfuse_data_from_default_response(
                     else choice.get("message", None)
                 )
 
+    elif resource.type == "embedding":
+        data = response.get("data", [])
+        if len(data) > 0:
+            first_embedding = data[0]
+            embedding_vector = (
+                first_embedding.embedding
+                if hasattr(first_embedding, "embedding")
+                else first_embedding.get("embedding", [])
+            )
+            completion = {
+                "dimensions": len(embedding_vector) if embedding_vector else 0,
+                "count": len(data),
+            }
+
     usage = _parse_usage(response.get("usage", None))
 
     return (model, completion, usage)
@@ -700,6 +837,191 @@ def _is_streaming_response(response: Any) -> bool:
     )
 
 
+_openai_stream_iter_hook_installed = False
+
+
+def _install_openai_stream_iteration_hooks() -> None:
+    global _openai_stream_iter_hook_installed
+
+    if not _is_openai_v1():
+        return
+
+    if not _openai_stream_iter_hook_installed:
+        original_iter = openai.Stream.__iter__
+        original_aiter = openai.AsyncStream.__aiter__
+
+        def traced_iter(self: Any) -> Any:
+            try:
+                yield from original_iter(self)
+            finally:
+                finalize_once = getattr(self, "_langfuse_finalize_once", None)
+                if finalize_once is not None:
+                    finalize_once()
+
+        async def traced_aiter(self: Any) -> Any:
+            try:
+                async for item in original_aiter(self):
+                    yield item
+            finally:
+                finalize_once = getattr(self, "_langfuse_finalize_once", None)
+                if finalize_once is not None:
+                    await finalize_once()
+
+        setattr(openai.Stream, "__iter__", traced_iter)
+        setattr(openai.AsyncStream, "__aiter__", traced_aiter)
+        _openai_stream_iter_hook_installed = True
+
+
+def _finalize_stream_response(
+    *,
+    resource: OpenAiDefinition,
+    items: list[Any],
+    generation: LangfuseGeneration,
+    completion_start_time: Optional[datetime],
+) -> None:
+    try:
+        model, completion, usage, metadata = (
+            _extract_streamed_response_api_response(items)
+            if resource.object == "Responses" or resource.object == "AsyncResponses"
+            else _extract_streamed_openai_response(resource, items)
+        )
+
+        _create_langfuse_update(
+            completion,
+            generation,
+            completion_start_time,
+            model=model,
+            usage=usage,
+            metadata=metadata,
+        )
+    except Exception:
+        pass
+    finally:
+        generation.end()
+
+
+def _instrument_openai_stream(
+    *,
+    resource: OpenAiDefinition,
+    response: Any,
+    generation: LangfuseGeneration,
+) -> Any:
+    if not hasattr(response, "_iterator"):
+        return LangfuseResponseGeneratorSync(
+            resource=resource,
+            response=response,
+            generation=generation,
+        )
+
+    items: list[Any] = []
+    raw_iterator = response._iterator
+    completion_start_time: Optional[datetime] = None
+    is_finalized = False
+    close = response.close
+
+    def finalize_once() -> None:
+        nonlocal is_finalized
+        if is_finalized:
+            return
+
+        is_finalized = True
+        _finalize_stream_response(
+            resource=resource,
+            items=items,
+            generation=generation,
+            completion_start_time=completion_start_time,
+        )
+
+    response._langfuse_finalize_once = finalize_once  # type: ignore[attr-defined]
+
+    def traced_iterator() -> Any:
+        nonlocal completion_start_time
+        try:
+            for item in raw_iterator:
+                items.append(item)
+
+                if completion_start_time is None:
+                    completion_start_time = _get_timestamp()
+
+                yield item
+        finally:
+            finalize_once()
+
+    def traced_close() -> Any:
+        try:
+            return close()
+        finally:
+            finalize_once()
+
+    response._iterator = traced_iterator()
+    response.close = traced_close
+
+    return response
+
+
+def _instrument_openai_async_stream(
+    *,
+    resource: OpenAiDefinition,
+    response: Any,
+    generation: LangfuseGeneration,
+) -> Any:
+    if not hasattr(response, "_iterator"):
+        return LangfuseResponseGeneratorAsync(
+            resource=resource,
+            response=response,
+            generation=generation,
+        )
+
+    items: list[Any] = []
+    raw_iterator = response._iterator
+    completion_start_time: Optional[datetime] = None
+    is_finalized = False
+    close = response.close
+
+    async def finalize_once() -> None:
+        nonlocal is_finalized
+        if is_finalized:
+            return
+
+        is_finalized = True
+        _finalize_stream_response(
+            resource=resource,
+            items=items,
+            generation=generation,
+            completion_start_time=completion_start_time,
+        )
+
+    response._langfuse_finalize_once = finalize_once  # type: ignore[attr-defined]
+
+    async def traced_iterator() -> Any:
+        nonlocal completion_start_time
+        try:
+            async for item in raw_iterator:
+                items.append(item)
+
+                if completion_start_time is None:
+                    completion_start_time = _get_timestamp()
+
+                yield item
+        finally:
+            await finalize_once()
+
+    async def traced_close() -> Any:
+        try:
+            return await close()
+        finally:
+            await finalize_once()
+
+    async def traced_aclose() -> Any:
+        return await traced_close()
+
+    response._iterator = traced_iterator()
+    response.close = traced_close
+    response.aclose = traced_aclose
+
+    return response
+
+
 @_langfuse_wrapper
 def _wrap(
     open_ai_resource: OpenAiDefinition, wrapped: Any, args: Any, kwargs: Any
@@ -710,7 +1032,12 @@ def _wrap(
     langfuse_data = _get_langfuse_data_from_kwargs(open_ai_resource, langfuse_args)
     langfuse_client = get_client(public_key=langfuse_args["langfuse_public_key"])
 
-    generation = langfuse_client.start_generation(
+    observation_type = (
+        "embedding" if open_ai_resource.type == "embedding" else "generation"
+    )
+
+    generation = langfuse_client.start_observation(
+        as_type=observation_type,  # type: ignore
         name=langfuse_data["name"],
         input=langfuse_data.get("input", None),
         metadata=langfuse_data.get("metadata", None),
@@ -728,7 +1055,13 @@ def _wrap(
     try:
         openai_response = wrapped(**arg_extractor.get_openai_args())
 
-        if _is_streaming_response(openai_response):
+        if _is_openai_v1() and isinstance(openai_response, openai.Stream):
+            return _instrument_openai_stream(
+                resource=open_ai_resource,
+                response=openai_response,
+                generation=generation,
+            )
+        elif _is_streaming_response(openai_response):
             return LangfuseResponseGeneratorSync(
                 resource=open_ai_resource,
                 response=openai_response,
@@ -747,11 +1080,14 @@ def _wrap(
                 model=model,
                 output=completion,
                 usage_details=usage,
+                cost_details=_parse_cost(openai_response.usage)
+                if hasattr(openai_response, "usage")
+                else None,
             ).end()
 
         return openai_response
     except Exception as ex:
-        log.warning(ex)
+        logger.warning(ex)
         model = kwargs.get("model", None) or None
         generation.update(
             status_message=str(ex),
@@ -773,7 +1109,12 @@ async def _wrap_async(
     langfuse_data = _get_langfuse_data_from_kwargs(open_ai_resource, langfuse_args)
     langfuse_client = get_client(public_key=langfuse_args["langfuse_public_key"])
 
-    generation = langfuse_client.start_generation(
+    observation_type = (
+        "embedding" if open_ai_resource.type == "embedding" else "generation"
+    )
+
+    generation = langfuse_client.start_observation(
+        as_type=observation_type,  # type: ignore
         name=langfuse_data["name"],
         input=langfuse_data.get("input", None),
         metadata=langfuse_data.get("metadata", None),
@@ -791,7 +1132,13 @@ async def _wrap_async(
     try:
         openai_response = await wrapped(**arg_extractor.get_openai_args())
 
-        if _is_streaming_response(openai_response):
+        if _is_openai_v1() and isinstance(openai_response, openai.AsyncStream):
+            return _instrument_openai_async_stream(
+                resource=open_ai_resource,
+                response=openai_response,
+                generation=generation,
+            )
+        elif _is_streaming_response(openai_response):
             return LangfuseResponseGeneratorAsync(
                 resource=open_ai_resource,
                 response=openai_response,
@@ -810,11 +1157,14 @@ async def _wrap_async(
                 output=completion,
                 usage=usage,  # backward compat for all V2 self hosters
                 usage_details=usage,
+                cost_details=_parse_cost(openai_response.usage)
+                if hasattr(openai_response, "usage")
+                else None,
             ).end()
 
         return openai_response
     except Exception as ex:
-        log.warning(ex)
+        logger.warning(ex)
         model = kwargs.get("model", None) or None
         generation.update(
             status_message=str(ex),
@@ -848,6 +1198,7 @@ def register_tracing() -> None:
 
 
 register_tracing()
+_install_openai_stream_iteration_hooks()
 
 
 class LangfuseResponseGeneratorSync:
@@ -864,6 +1215,7 @@ class LangfuseResponseGeneratorSync:
         self.response = response
         self.generation = generation
         self.completion_start_time: Optional[datetime] = None
+        self._is_finalized = False
 
     def __iter__(self) -> Any:
         try:
@@ -896,28 +1248,28 @@ class LangfuseResponseGeneratorSync:
         return self.__iter__()
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        pass
+        self.close()
+
+    def close(self) -> None:
+        close = getattr(self.response, "close", None)
+
+        try:
+            if callable(close):
+                close()
+        finally:
+            self._finalize()
 
     def _finalize(self) -> None:
-        try:
-            model, completion, usage, metadata = (
-                _extract_streamed_response_api_response(self.items)
-                if self.resource.object == "Responses"
-                else _extract_streamed_openai_response(self.resource, self.items)
-            )
+        if self._is_finalized:
+            return
 
-            _create_langfuse_update(
-                completion,
-                self.generation,
-                self.completion_start_time,
-                model=model,
-                usage=usage,
-                metadata=metadata,
-            )
-        except Exception:
-            pass
-        finally:
-            self.generation.end()
+        self._is_finalized = True
+        _finalize_stream_response(
+            resource=self.resource,
+            items=self.items,
+            generation=self.generation,
+            completion_start_time=self.completion_start_time,
+        )
 
 
 class LangfuseResponseGeneratorAsync:
@@ -934,6 +1286,7 @@ class LangfuseResponseGeneratorAsync:
         self.response = response
         self.generation = generation
         self.completion_start_time: Optional[datetime] = None
+        self._is_finalized = False
 
     async def __aiter__(self) -> Any:
         try:
@@ -966,39 +1319,56 @@ class LangfuseResponseGeneratorAsync:
         return self.__aiter__()
 
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        pass
+        await self.aclose()
 
     async def _finalize(self) -> None:
-        try:
-            model, completion, usage, metadata = (
-                _extract_streamed_response_api_response(self.items)
-                if self.resource.object == "Responses"
-                else _extract_streamed_openai_response(self.resource, self.items)
-            )
+        if self._is_finalized:
+            return
 
-            _create_langfuse_update(
-                completion,
-                self.generation,
-                self.completion_start_time,
-                model=model,
-                usage=usage,
-                metadata=metadata,
-            )
-        except Exception:
-            pass
-        finally:
-            self.generation.end()
+        self._is_finalized = True
+        _finalize_stream_response(
+            resource=self.resource,
+            items=self.items,
+            generation=self.generation,
+            completion_start_time=self.completion_start_time,
+        )
 
     async def close(self) -> None:
         """Close the response and release the connection.
 
         Automatically called if the response body is read to completion.
         """
-        await self.response.close()
+        close = getattr(self.response, "close", None)
+        aclose = getattr(self.response, "aclose", None)
+
+        try:
+            if callable(close):
+                result = close()
+                if isawaitable(result):
+                    await result
+            elif callable(aclose):
+                result = aclose()
+                if isawaitable(result):
+                    await result
+        finally:
+            await self._finalize()
 
     async def aclose(self) -> None:
         """Close the response and release the connection.
 
         Automatically called if the response body is read to completion.
         """
-        await self.response.aclose()
+        aclose = getattr(self.response, "aclose", None)
+        close = getattr(self.response, "close", None)
+
+        try:
+            if callable(aclose):
+                result = aclose()
+                if isawaitable(result):
+                    await result
+            elif callable(close):
+                result = close()
+                if isawaitable(result):
+                    await result
+        finally:
+            await self._finalize()

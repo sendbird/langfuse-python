@@ -1,6 +1,6 @@
 import asyncio
+import contextvars
 import inspect
-import logging
 import os
 from functools import wraps
 from typing import (
@@ -10,7 +10,7 @@ from typing import (
     Dict,
     Generator,
     Iterable,
-    Literal,
+    List,
     Optional,
     Tuple,
     TypeVar,
@@ -22,11 +22,26 @@ from typing import (
 from opentelemetry.util._decorator import _AgnosticContextManager
 from typing_extensions import ParamSpec
 
+from langfuse._client.constants import (
+    ObservationTypeLiteralNoEvent,
+    get_observation_types_list,
+)
 from langfuse._client.environment_variables import (
     LANGFUSE_OBSERVE_DECORATOR_IO_CAPTURE_ENABLED,
 )
-from langfuse._client.get_client import get_client
-from langfuse._client.span import LangfuseGeneration, LangfuseSpan
+from langfuse._client.get_client import _set_current_public_key, get_client
+from langfuse._client.span import (
+    LangfuseAgent,
+    LangfuseChain,
+    LangfuseEmbedding,
+    LangfuseEvaluator,
+    LangfuseGeneration,
+    LangfuseGuardrail,
+    LangfuseRetriever,
+    LangfuseSpan,
+    LangfuseTool,
+)
+from langfuse.logger import langfuse_logger as logger
 from langfuse.types import TraceContext
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -54,8 +69,6 @@ class LangfuseDecorator:
     - Thread-safe client resolution when multiple Langfuse projects are used
     """
 
-    _log = logging.getLogger("langfuse")
-
     @overload
     def observe(self, func: F) -> F: ...
 
@@ -65,7 +78,7 @@ class LangfuseDecorator:
         func: None = None,
         *,
         name: Optional[str] = None,
-        as_type: Optional[Literal["generation"]] = None,
+        as_type: Optional[ObservationTypeLiteralNoEvent] = None,
         capture_input: Optional[bool] = None,
         capture_output: Optional[bool] = None,
         transform_to_string: Optional[Callable[[Iterable], str]] = None,
@@ -76,7 +89,7 @@ class LangfuseDecorator:
         func: Optional[F] = None,
         *,
         name: Optional[str] = None,
-        as_type: Optional[Literal["generation"]] = None,
+        as_type: Optional[ObservationTypeLiteralNoEvent] = None,
         capture_input: Optional[bool] = None,
         capture_output: Optional[bool] = None,
         transform_to_string: Optional[Callable[[Iterable], str]] = None,
@@ -93,8 +106,11 @@ class LangfuseDecorator:
         Args:
             func (Optional[Callable]): The function to decorate. When used with parentheses @observe(), this will be None.
             name (Optional[str]): Custom name for the created trace or span. If not provided, the function name is used.
-            as_type (Optional[Literal["generation"]]): Set to "generation" to create a specialized LLM generation span
-                    with model metrics support, suitable for tracking language model outputs.
+            as_type (Optional[Literal]): Set the observation type. Supported values:
+                    "generation", "span", "agent", "tool", "chain", "retriever", "embedding", "evaluator", "guardrail".
+                    Observation types are highlighted in the Langfuse UI for filtering and visualization.
+                    The types "generation" and "embedding" create a span on which additional attributes such as model metrics
+                    can be set.
 
         Returns:
             Callable: A wrapped version of the original function that automatically creates and manages Langfuse spans.
@@ -146,6 +162,13 @@ class LangfuseDecorator:
             - For async functions, the decorator returns an async function wrapper.
             - For sync functions, the decorator returns a synchronous wrapper.
         """
+        valid_types = set(get_observation_types_list(ObservationTypeLiteralNoEvent))
+        if as_type is not None and as_type not in valid_types:
+            logger.warning(
+                f"Invalid as_type '{as_type}'. Valid types are: {', '.join(sorted(valid_types))}. Defaulting to 'span'."
+            )
+            as_type = "span"
+
         function_io_capture_enabled = os.environ.get(
             LANGFUSE_OBSERVE_DECORATOR_IO_CAPTURE_ENABLED, "True"
         ).lower() not in ("false", "0")
@@ -182,13 +205,13 @@ class LangfuseDecorator:
             )
 
         """Handle decorator with or without parentheses.
-        
+
         This logic enables the decorator to work both with and without parentheses:
         - @observe - Python passes the function directly to the decorator
         - @observe() - Python calls the decorator first, which must return a function decorator
-        
+
         When called without arguments (@observe), the func parameter contains the function to decorate,
-        so we directly apply the decorator to it. When called with parentheses (@observe()), 
+        so we directly apply the decorator to it. When called with parentheses (@observe()),
         func is None, so we return the decorator function itself for Python to apply in the next step.
         """
         if func is None:
@@ -201,7 +224,7 @@ class LangfuseDecorator:
         func: F,
         *,
         name: Optional[str],
-        as_type: Optional[Literal["generation"]],
+        as_type: Optional[ObservationTypeLiteralNoEvent],
         capture_input: bool,
         capture_output: bool,
         transform_to_string: Optional[Callable[[Iterable], str]] = None,
@@ -231,72 +254,61 @@ class LangfuseDecorator:
                 else None
             )
             public_key = cast(str, kwargs.pop("langfuse_public_key", None))
-            langfuse_client = get_client(public_key=public_key)
-            context_manager: Optional[
-                Union[
-                    _AgnosticContextManager[LangfuseGeneration],
-                    _AgnosticContextManager[LangfuseSpan],
-                ]
-            ] = (
-                (
-                    langfuse_client.start_as_current_generation(
+
+            # Set public key in execution context for nested decorated functions
+            with _set_current_public_key(public_key):
+                langfuse_client = get_client(public_key=public_key)
+                context_manager: Optional[
+                    Union[
+                        _AgnosticContextManager[LangfuseGeneration],
+                        _AgnosticContextManager[LangfuseSpan],
+                        _AgnosticContextManager[LangfuseAgent],
+                        _AgnosticContextManager[LangfuseTool],
+                        _AgnosticContextManager[LangfuseChain],
+                        _AgnosticContextManager[LangfuseRetriever],
+                        _AgnosticContextManager[LangfuseEvaluator],
+                        _AgnosticContextManager[LangfuseEmbedding],
+                        _AgnosticContextManager[LangfuseGuardrail],
+                    ]
+                ] = (
+                    langfuse_client.start_as_current_observation(
                         name=final_name,
+                        as_type=as_type or "span",
                         trace_context=trace_context,
                         input=input,
                         end_on_exit=False,  # when returning a generator, closing on exit would be to early
                     )
-                    if as_type == "generation"
-                    else langfuse_client.start_as_current_span(
-                        name=final_name,
-                        trace_context=trace_context,
-                        input=input,
-                        end_on_exit=False,  # when returning a generator, closing on exit would be to early
-                    )
+                    if langfuse_client
+                    else None
                 )
-                if langfuse_client
-                else None
-            )
 
-            if context_manager is None:
-                return await func(*args, **kwargs)
+                if context_manager is None:
+                    return await func(*args, **kwargs)
 
-            with context_manager as langfuse_span_or_generation:
-                is_return_type_generator = False
+                with context_manager as langfuse_span_or_generation:
+                    is_return_type_generator = False
 
-                try:
-                    result = await func(*args, **kwargs)
+                    try:
+                        result = await func(*args, **kwargs)
+                        (
+                            is_return_type_generator,
+                            result,
+                        ) = self._handle_observe_result(
+                            langfuse_span_or_generation,
+                            result,
+                            capture_output=capture_output,
+                            transform_to_string=transform_to_string,
+                        )
+                        return result
+                    except (Exception, asyncio.CancelledError) as e:
+                        langfuse_span_or_generation.update(
+                            level="ERROR", status_message=str(e) or type(e).__name__
+                        )
 
-                    if capture_output is True:
-                        if inspect.isgenerator(result):
-                            is_return_type_generator = True
-
-                            return self._wrap_sync_generator_result(
-                                langfuse_span_or_generation,
-                                result,
-                                transform_to_string,
-                            )
-
-                        if inspect.isasyncgen(result):
-                            is_return_type_generator = True
-
-                            return self._wrap_async_generator_result(
-                                langfuse_span_or_generation,
-                                result,
-                                transform_to_string,
-                            )
-
-                        langfuse_span_or_generation.update(output=result)
-
-                    return result
-                except Exception as e:
-                    langfuse_span_or_generation.update(
-                        level="ERROR", status_message=str(e)
-                    )
-
-                    raise e
-                finally:
-                    if not is_return_type_generator:
-                        langfuse_span_or_generation.end()
+                        raise e
+                    finally:
+                        if not is_return_type_generator:
+                            langfuse_span_or_generation.end()
 
         return cast(F, async_wrapper)
 
@@ -305,7 +317,7 @@ class LangfuseDecorator:
         func: F,
         *,
         name: Optional[str],
-        as_type: Optional[Literal["generation"]],
+        as_type: Optional[ObservationTypeLiteralNoEvent],
         capture_input: bool,
         capture_output: bool,
         transform_to_string: Optional[Callable[[Iterable], str]] = None,
@@ -333,72 +345,61 @@ class LangfuseDecorator:
                 else None
             )
             public_key = kwargs.pop("langfuse_public_key", None)
-            langfuse_client = get_client(public_key=public_key)
-            context_manager: Optional[
-                Union[
-                    _AgnosticContextManager[LangfuseGeneration],
-                    _AgnosticContextManager[LangfuseSpan],
-                ]
-            ] = (
-                (
-                    langfuse_client.start_as_current_generation(
+
+            # Set public key in execution context for nested decorated functions
+            with _set_current_public_key(public_key):
+                langfuse_client = get_client(public_key=public_key)
+                context_manager: Optional[
+                    Union[
+                        _AgnosticContextManager[LangfuseGeneration],
+                        _AgnosticContextManager[LangfuseSpan],
+                        _AgnosticContextManager[LangfuseAgent],
+                        _AgnosticContextManager[LangfuseTool],
+                        _AgnosticContextManager[LangfuseChain],
+                        _AgnosticContextManager[LangfuseRetriever],
+                        _AgnosticContextManager[LangfuseEvaluator],
+                        _AgnosticContextManager[LangfuseEmbedding],
+                        _AgnosticContextManager[LangfuseGuardrail],
+                    ]
+                ] = (
+                    langfuse_client.start_as_current_observation(
                         name=final_name,
+                        as_type=as_type or "span",
                         trace_context=trace_context,
                         input=input,
                         end_on_exit=False,  # when returning a generator, closing on exit would be to early
                     )
-                    if as_type == "generation"
-                    else langfuse_client.start_as_current_span(
-                        name=final_name,
-                        trace_context=trace_context,
-                        input=input,
-                        end_on_exit=False,  # when returning a generator, closing on exit would be to early
-                    )
+                    if langfuse_client
+                    else None
                 )
-                if langfuse_client
-                else None
-            )
 
-            if context_manager is None:
-                return func(*args, **kwargs)
+                if context_manager is None:
+                    return func(*args, **kwargs)
 
-            with context_manager as langfuse_span_or_generation:
-                is_return_type_generator = False
+                with context_manager as langfuse_span_or_generation:
+                    is_return_type_generator = False
 
-                try:
-                    result = func(*args, **kwargs)
+                    try:
+                        result = func(*args, **kwargs)
+                        (
+                            is_return_type_generator,
+                            result,
+                        ) = self._handle_observe_result(
+                            langfuse_span_or_generation,
+                            result,
+                            capture_output=capture_output,
+                            transform_to_string=transform_to_string,
+                        )
+                        return result
+                    except (Exception, asyncio.CancelledError) as e:
+                        langfuse_span_or_generation.update(
+                            level="ERROR", status_message=str(e) or type(e).__name__
+                        )
 
-                    if capture_output is True:
-                        if inspect.isgenerator(result):
-                            is_return_type_generator = True
-
-                            return self._wrap_sync_generator_result(
-                                langfuse_span_or_generation,
-                                result,
-                                transform_to_string,
-                            )
-
-                        if inspect.isasyncgen(result):
-                            is_return_type_generator = True
-
-                            return self._wrap_async_generator_result(
-                                langfuse_span_or_generation,
-                                result,
-                                transform_to_string,
-                            )
-
-                        langfuse_span_or_generation.update(output=result)
-
-                    return result
-                except Exception as e:
-                    langfuse_span_or_generation.update(
-                        level="ERROR", status_message=str(e)
-                    )
-
-                    raise e
-                finally:
-                    if not is_return_type_generator:
-                        langfuse_span_or_generation.end()
+                        raise e
+                    finally:
+                        if not is_return_type_generator:
+                            langfuse_span_or_generation.end()
 
         return cast(F, sync_wrapper)
 
@@ -426,57 +427,317 @@ class LangfuseDecorator:
 
     def _wrap_sync_generator_result(
         self,
-        langfuse_span_or_generation: Union[LangfuseSpan, LangfuseGeneration],
+        langfuse_span_or_generation: Union[
+            LangfuseSpan,
+            LangfuseGeneration,
+            LangfuseAgent,
+            LangfuseTool,
+            LangfuseChain,
+            LangfuseRetriever,
+            LangfuseEvaluator,
+            LangfuseEmbedding,
+            LangfuseGuardrail,
+        ],
         generator: Generator,
+        capture_output: bool,
         transform_to_string: Optional[Callable[[Iterable], str]] = None,
     ) -> Any:
-        items = []
+        preserved_context = contextvars.copy_context()
 
-        try:
-            for item in generator:
-                items.append(item)
+        return _ContextPreservedSyncGeneratorWrapper(
+            generator,
+            preserved_context,
+            langfuse_span_or_generation,
+            capture_output,
+            transform_to_string,
+        )
 
-                yield item
-
-        finally:
-            output: Any = items
-
-            if transform_to_string is not None:
-                output = transform_to_string(items)
-
-            elif all(isinstance(item, str) for item in items):
-                output = "".join(items)
-
-            langfuse_span_or_generation.update(output=output)
-            langfuse_span_or_generation.end()
-
-    async def _wrap_async_generator_result(
+    def _wrap_async_generator_result(
         self,
-        langfuse_span_or_generation: Union[LangfuseSpan, LangfuseGeneration],
+        langfuse_span_or_generation: Union[
+            LangfuseSpan,
+            LangfuseGeneration,
+            LangfuseAgent,
+            LangfuseTool,
+            LangfuseChain,
+            LangfuseRetriever,
+            LangfuseEvaluator,
+            LangfuseEmbedding,
+            LangfuseGuardrail,
+        ],
         generator: AsyncGenerator,
+        capture_output: bool,
         transform_to_string: Optional[Callable[[Iterable], str]] = None,
-    ) -> AsyncGenerator:
-        items = []
+    ) -> Any:
+        preserved_context = contextvars.copy_context()
 
-        try:
-            async for item in generator:
-                items.append(item)
+        return _ContextPreservedAsyncGeneratorWrapper(
+            generator,
+            preserved_context,
+            langfuse_span_or_generation,
+            capture_output,
+            transform_to_string,
+        )
 
-                yield item
+    def _handle_observe_result(
+        self,
+        langfuse_span_or_generation: Union[
+            LangfuseSpan,
+            LangfuseGeneration,
+            LangfuseAgent,
+            LangfuseTool,
+            LangfuseChain,
+            LangfuseRetriever,
+            LangfuseEvaluator,
+            LangfuseEmbedding,
+            LangfuseGuardrail,
+        ],
+        result: Any,
+        *,
+        capture_output: bool,
+        transform_to_string: Optional[Callable[[Iterable], str]] = None,
+    ) -> Tuple[bool, Any]:
+        if inspect.isgenerator(result):
+            return True, self._wrap_sync_generator_result(
+                langfuse_span_or_generation,
+                result,
+                capture_output,
+                transform_to_string,
+            )
 
-        finally:
-            output: Any = items
+        if inspect.isasyncgen(result):
+            return True, self._wrap_async_generator_result(
+                langfuse_span_or_generation,
+                result,
+                capture_output,
+                transform_to_string,
+            )
 
-            if transform_to_string is not None:
-                output = transform_to_string(items)
+        # handle starlette.StreamingResponse
+        if type(result).__name__ == "StreamingResponse" and hasattr(
+            result, "body_iterator"
+        ):
+            result.body_iterator = self._wrap_async_generator_result(
+                langfuse_span_or_generation,
+                result.body_iterator,
+                capture_output,
+                transform_to_string,
+            )
+            return True, result
 
-            elif all(isinstance(item, str) for item in items):
-                output = "".join(items)
+        if capture_output is True:
+            langfuse_span_or_generation.update(output=result)
 
-            langfuse_span_or_generation.update(output=output)
-            langfuse_span_or_generation.end()
+        return False, result
 
 
 _decorator = LangfuseDecorator()
 
 observe = _decorator.observe
+
+
+class _ContextPreservedSyncGeneratorWrapper:
+    """Sync generator wrapper that ensures each iteration runs in preserved context."""
+
+    def __init__(
+        self,
+        generator: Generator,
+        context: contextvars.Context,
+        span: Union[
+            LangfuseSpan,
+            LangfuseGeneration,
+            LangfuseAgent,
+            LangfuseTool,
+            LangfuseChain,
+            LangfuseRetriever,
+            LangfuseEvaluator,
+            LangfuseEmbedding,
+            LangfuseGuardrail,
+        ],
+        capture_output: bool,
+        transform_fn: Optional[Callable[[Iterable], str]],
+    ) -> None:
+        self.generator = generator
+        self.context = context
+        self.items: List[Any] = []
+        self.span = span
+        self.capture_output = capture_output
+        self.transform_fn = transform_fn
+        self._span_ended = False
+
+    def __iter__(self) -> "_ContextPreservedSyncGeneratorWrapper":
+        return self
+
+    def _finalize(self) -> None:
+        if self._span_ended:
+            return
+
+        if self.capture_output:
+            output: Any = self.items
+
+            if self.transform_fn is not None:
+                output = self.transform_fn(self.items)
+
+            elif all(isinstance(item, str) for item in self.items):
+                output = "".join(self.items)
+
+            self.span.update(output=output)
+
+        self.span.end()
+        self._span_ended = True
+
+    def _finalize_with_error(self, error: BaseException) -> None:
+        if self._span_ended:
+            return
+
+        self.span.update(
+            level="ERROR", status_message=str(error) or type(error).__name__
+        ).end()
+        self._span_ended = True
+
+    def close(self) -> None:
+        if self._span_ended:
+            return
+
+        try:
+            self.context.run(self.generator.close)
+        except (Exception, asyncio.CancelledError) as error:
+            self._finalize_with_error(error)
+            raise
+        else:
+            self._finalize()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+    def __next__(self) -> Any:
+        try:
+            # Run the generator's __next__ in the preserved context
+            item = self.context.run(next, self.generator)
+            if self.capture_output:
+                self.items.append(item)
+
+            return item
+
+        except StopIteration:
+            self._finalize()
+            raise  # Re-raise StopIteration
+
+        except (Exception, asyncio.CancelledError) as e:
+            self._finalize_with_error(e)
+            raise
+
+
+class _ContextPreservedAsyncGeneratorWrapper:
+    """Async generator wrapper that ensures each iteration runs in preserved context."""
+
+    def __init__(
+        self,
+        generator: AsyncGenerator,
+        context: contextvars.Context,
+        span: Union[
+            LangfuseSpan,
+            LangfuseGeneration,
+            LangfuseAgent,
+            LangfuseTool,
+            LangfuseChain,
+            LangfuseRetriever,
+            LangfuseEvaluator,
+            LangfuseEmbedding,
+            LangfuseGuardrail,
+        ],
+        capture_output: bool,
+        transform_fn: Optional[Callable[[Iterable], str]],
+    ) -> None:
+        self.generator = generator
+        self.context = context
+        self.items: List[Any] = []
+        self.span = span
+        self.capture_output = capture_output
+        self.transform_fn = transform_fn
+        self._span_ended = False
+
+    def __aiter__(self) -> "_ContextPreservedAsyncGeneratorWrapper":
+        return self
+
+    def _finalize(self) -> None:
+        if self._span_ended:
+            return
+
+        if self.capture_output:
+            output: Any = self.items
+
+            if self.transform_fn is not None:
+                output = self.transform_fn(self.items)
+
+            elif all(isinstance(item, str) for item in self.items):
+                output = "".join(self.items)
+
+            self.span.update(output=output)
+
+        self.span.end()
+        self._span_ended = True
+
+    def _finalize_with_error(self, error: BaseException) -> None:
+        if self._span_ended:
+            return
+
+        self.span.update(
+            level="ERROR", status_message=str(error) or type(error).__name__
+        ).end()
+        self._span_ended = True
+
+    async def aclose(self) -> None:
+        if self._span_ended:
+            return
+
+        try:
+            try:
+                await asyncio.create_task(
+                    self.generator.aclose(),
+                    context=self.context,
+                )  # type: ignore
+            except TypeError:
+                await self.context.run(asyncio.create_task, self.generator.aclose())
+        except (Exception, asyncio.CancelledError) as error:
+            self._finalize_with_error(error)
+            raise
+        else:
+            self._finalize()
+
+    async def close(self) -> None:
+        await self.aclose()
+
+    def __del__(self) -> None:
+        self._finalize()
+
+    async def __anext__(self) -> Any:
+        try:
+            # Run the generator's __anext__ in the preserved context
+            try:
+                # Python 3.11+ approach with explicit task context
+                item = await asyncio.create_task(
+                    self.generator.__anext__(),  # type: ignore
+                    context=self.context,
+                )  # type: ignore
+            except TypeError:
+                # Python 3.10 fallback - create the task inside the preserved context.
+                item = await self.context.run(
+                    asyncio.create_task,
+                    self.generator.__anext__(),  # type: ignore
+                )
+
+            if self.capture_output:
+                self.items.append(item)
+
+            return item
+
+        except StopAsyncIteration:
+            self._finalize()
+            raise  # Re-raise StopAsyncIteration
+        except (Exception, asyncio.CancelledError) as e:
+            self._finalize_with_error(e)
+            raise

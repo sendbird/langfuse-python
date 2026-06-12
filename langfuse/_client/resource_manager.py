@@ -18,12 +18,13 @@ import atexit
 import os
 import threading
 from queue import Full, Queue
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import httpx
 from opentelemetry import trace as otel_trace_api
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.sampling import Decision, TraceIdRatioBased
 from opentelemetry.trace import Tracer
 
@@ -42,11 +43,11 @@ from langfuse._task_manager.score_ingestion_consumer import ScoreIngestionConsum
 from langfuse._utils.environment import get_common_release_envs
 from langfuse._utils.prompt_cache import PromptCache
 from langfuse._utils.request import LangfuseClient
-from langfuse.api.client import AsyncFernLangfuse, FernLangfuse
+from langfuse.api import AsyncLangfuseAPI, LangfuseAPI
 from langfuse.logger import langfuse_logger
 from langfuse.types import MaskFunction
 
-from ..version import __version__ as langfuse_version
+from .._version import __version__ as langfuse_version
 
 
 class LangfuseResourceManager:
@@ -83,7 +84,7 @@ class LangfuseResourceManager:
         *,
         public_key: str,
         secret_key: str,
-        host: str,
+        base_url: str,
         environment: Optional[str] = None,
         release: Optional[str] = None,
         timeout: Optional[int] = None,
@@ -95,8 +96,10 @@ class LangfuseResourceManager:
         mask: Optional[MaskFunction] = None,
         tracing_enabled: Optional[bool] = None,
         blocked_instrumentation_scopes: Optional[List[str]] = None,
+        should_export_span: Optional[Callable[[ReadableSpan], bool]] = None,
         additional_headers: Optional[Dict[str, str]] = None,
         tracer_provider: Optional[TracerProvider] = None,
+        span_exporter: Optional[SpanExporter] = None,
     ) -> "LangfuseResourceManager":
         if public_key in cls._instances:
             return cls._instances[public_key]
@@ -115,7 +118,7 @@ class LangfuseResourceManager:
                 instance._initialize_instance(
                     public_key=public_key,
                     secret_key=secret_key,
-                    host=host,
+                    base_url=base_url,
                     timeout=timeout,
                     environment=environment,
                     release=release,
@@ -129,8 +132,10 @@ class LangfuseResourceManager:
                     if tracing_enabled is not None
                     else True,
                     blocked_instrumentation_scopes=blocked_instrumentation_scopes,
+                    should_export_span=should_export_span,
                     additional_headers=additional_headers,
                     tracer_provider=tracer_provider,
+                    span_exporter=span_exporter,
                 )
 
                 cls._instances[public_key] = instance
@@ -142,7 +147,7 @@ class LangfuseResourceManager:
         *,
         public_key: str,
         secret_key: str,
-        host: str,
+        base_url: str,
         environment: Optional[str] = None,
         release: Optional[str] = None,
         timeout: Optional[int] = None,
@@ -154,30 +159,49 @@ class LangfuseResourceManager:
         mask: Optional[MaskFunction] = None,
         tracing_enabled: bool = True,
         blocked_instrumentation_scopes: Optional[List[str]] = None,
+        should_export_span: Optional[Callable[[ReadableSpan], bool]] = None,
         additional_headers: Optional[Dict[str, str]] = None,
         tracer_provider: Optional[TracerProvider] = None,
+        span_exporter: Optional[SpanExporter] = None,
     ) -> None:
         self.public_key = public_key
         self.secret_key = secret_key
         self.tracing_enabled = tracing_enabled
-        self.host = host
+        self.base_url = base_url
         self.mask = mask
+        self.environment = environment
+
+        # Store additional client settings for get_client() to use
+        self.timeout = timeout
+        self.flush_at = flush_at
+        self.flush_interval = flush_interval
+        self.release = release
+        self.media_upload_thread_count = media_upload_thread_count
+        self.sample_rate = sample_rate
+        self.blocked_instrumentation_scopes = blocked_instrumentation_scopes
+        self.should_export_span = should_export_span
+        self.additional_headers = additional_headers
+        self.span_exporter = span_exporter
+        self.tracer_provider: Optional[TracerProvider] = None
 
         # OTEL Tracer
         if tracing_enabled:
             tracer_provider = tracer_provider or _init_tracer_provider(
                 environment=environment, release=release, sample_rate=sample_rate
             )
+            self.tracer_provider = tracer_provider
 
             langfuse_processor = LangfuseSpanProcessor(
                 public_key=self.public_key,
                 secret_key=secret_key,
-                host=host,
+                base_url=base_url,
                 timeout=timeout,
                 flush_at=flush_at,
                 flush_interval=flush_interval,
                 blocked_instrumentation_scopes=blocked_instrumentation_scopes,
+                should_export_span=should_export_span,
                 additional_headers=additional_headers,
+                span_exporter=span_exporter,
             )
             tracer_provider.add_span_processor(langfuse_processor)
 
@@ -200,8 +224,8 @@ class LangfuseResourceManager:
             client_headers = additional_headers if additional_headers else {}
             self.httpx_client = httpx.Client(timeout=timeout, headers=client_headers)
 
-        self.api = FernLangfuse(
-            base_url=host,
+        self.api = LangfuseAPI(
+            base_url=base_url,
             username=self.public_key,
             password=secret_key,
             x_langfuse_sdk_name="python",
@@ -210,8 +234,8 @@ class LangfuseResourceManager:
             httpx_client=self.httpx_client,
             timeout=timeout,
         )
-        self.async_api = AsyncFernLangfuse(
-            base_url=host,
+        self.async_api = AsyncLangfuseAPI(
+            base_url=base_url,
             username=self.public_key,
             password=secret_key,
             x_langfuse_sdk_name="python",
@@ -222,7 +246,7 @@ class LangfuseResourceManager:
         score_ingestion_client = LangfuseClient(
             public_key=self.public_key,
             secret_key=secret_key,
-            base_url=host,
+            base_url=base_url,
             version=langfuse_version,
             timeout=timeout or 20,
             session=self.httpx_client,
@@ -236,6 +260,7 @@ class LangfuseResourceManager:
         self._media_upload_queue: Queue[Any] = Queue(100_000)
         self._media_manager = MediaManager(
             api_client=self.api,
+            httpx_client=self.httpx_client,
             media_upload_queue=self._media_upload_queue,
             max_retries=3,
         )
@@ -279,7 +304,7 @@ class LangfuseResourceManager:
         langfuse_logger.info(
             f"Startup: Langfuse tracer successfully initialized | "
             f"public_key={self.public_key} | "
-            f"host={host} | "
+            f"base_url={base_url} | "
             f"environment={environment or 'default'} | "
             f"sample_rate={sample_rate if sample_rate is not None else 1.0} | "
             f"media_threads={media_upload_thread_count or 1}"
@@ -338,6 +363,29 @@ class LangfuseResourceManager:
 
             return
 
+    def add_trace_task(
+        self,
+        event: dict,
+    ) -> None:
+        try:
+            langfuse_logger.debug(
+                f"Trace: Enqueuing event type={event['type']} for trace_id={event['body'].id}"
+            )
+            self._score_ingestion_queue.put(event, block=False)
+
+        except Full:
+            langfuse_logger.warning(
+                "System overload: Trace ingestion queue has reached capacity (100,000 items). Trace update will be dropped. Consider increasing flush frequency or decreasing event volume."
+            )
+
+            return
+        except Exception as e:
+            langfuse_logger.error(
+                f"Unexpected error: Failed to process trace event. The trace update will be dropped. Error details: {e}"
+            )
+
+            return
+
     @property
     def tracer(self) -> Optional[Tracer]:
         return self._otel_tracer
@@ -356,6 +404,8 @@ class LangfuseResourceManager:
         )
         for media_upload_consumer in self._media_upload_consumers:
             media_upload_consumer.pause()
+
+        self._media_manager.signal_shutdown(count=len(self._media_upload_consumers))
 
         for media_upload_consumer in self._media_upload_consumers:
             try:
@@ -386,12 +436,11 @@ class LangfuseResourceManager:
             )
 
     def flush(self) -> None:
-        tracer_provider = cast(TracerProvider, otel_trace_api.get_tracer_provider())
-        if isinstance(tracer_provider, otel_trace_api.ProxyTracerProvider):
-            return
-
-        tracer_provider.force_flush()
-        langfuse_logger.debug("Successfully flushed OTEL tracer provider")
+        if self.tracer_provider is not None and not isinstance(
+            self.tracer_provider, otel_trace_api.ProxyTracerProvider
+        ):
+            self.tracer_provider.force_flush()
+            langfuse_logger.debug("Successfully flushed OTEL tracer provider")
 
         self._score_ingestion_queue.join()
         langfuse_logger.debug("Successfully flushed score ingestion queue")
@@ -403,12 +452,7 @@ class LangfuseResourceManager:
         # Unregister the atexit handler first
         atexit.unregister(self.shutdown)
 
-        tracer_provider = cast(TracerProvider, otel_trace_api.get_tracer_provider())
-        if isinstance(tracer_provider, otel_trace_api.ProxyTracerProvider):
-            return
-
-        tracer_provider.force_flush()
-
+        self.flush()
         self._stop_and_join_consumer_threads()
 
 
